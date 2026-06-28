@@ -141,20 +141,13 @@ function initAudioEngine() {
 
     let audioCtx = null;
     let analyser = null;
+    let audioBuffer = null;
+    let currentSource = null;
+    let gainNode = null;
     let isPlaying = false;
-    let schedulerTimerId = null;
+    let isLoading = false;
     let stopTimerId = null;
     let drawVisualId = null;
-    
-    // Drum tempo & scheduling vars
-    const tempo = 140; // BPM
-    const lookahead = 25.0; // How frequently to call scheduler (in ms)
-    const scheduleAheadTime = 0.1; // How far ahead to schedule audio (sec)
-    let nextNoteTime = 0.0; // When the next note is due
-    let current16thNote = 0; // Current 16th note step in loop (0-15)
-    
-    // Sound synthesis noise buffers
-    let noiseBuffer = null;
 
     // Set up canvas sizes
     const ctx2d = canvas.getContext('2d');
@@ -168,51 +161,82 @@ function initAudioEngine() {
         ctx2d.scale(dpr, dpr);
     }
 
-    // Generate White Noise Buffer for Hi-Hats & Snares
-    function createNoiseBuffer(ctx) {
-        const bufferSize = ctx.sampleRate * 2;
-        const buffer = ctx.createBuffer(1, bufferSize, ctx.sampleRate);
-        const data = buffer.getChannelData(0);
-        for (let i = 0; i < bufferSize; i++) {
-            data[i] = Math.random() * 2 - 1;
+    // Pre-init AudioContext and fetch Audio Buffer
+    async function loadAudio() {
+        if (audioBuffer || isLoading) return;
+        isLoading = true;
+        audioStatus.textContent = 'LOADING MUSIC...';
+
+        try {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+                analyser = audioCtx.createAnalyser();
+                analyser.fftSize = 256;
+            }
+            const response = await fetch('assets/hustler.wav');
+            const arrayBuffer = await response.arrayBuffer();
+            audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            audioStatus.textContent = '脳天を揺らす808。15秒で世界が変わる。';
+        } catch (err) {
+            console.error('Failed to load audio:', err);
+            audioStatus.textContent = '脳天を揺らす808。15秒で世界が変わる。';
+        } finally {
+            isLoading = false;
         }
-        return buffer;
     }
 
+    // Preload audio on hover or initial touch for instant response
+    btnPreview.addEventListener('mouseenter', loadAudio, { once: true });
+    btnPreview.addEventListener('touchstart', loadAudio, { once: true, passive: true });
+
     // Trigger Play / Stop
-    btnPreview.addEventListener('click', () => {
+    btnPreview.addEventListener('click', async () => {
         if (isPlaying) {
             stopBeat();
         } else {
-            startBeat();
+            await startBeat();
         }
     });
 
-    function startBeat() {
-        // Initialize Web Audio Context on user gesture
+    async function startBeat() {
         if (!audioCtx) {
             audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             analyser = audioCtx.createAnalyser();
             analyser.fftSize = 256;
-            noiseBuffer = createNoiseBuffer(audioCtx);
         }
 
-        // Resume context if suspended (browser safety)
         if (audioCtx.state === 'suspended') {
-            audioCtx.resume();
+            await audioCtx.resume();
+        }
+
+        if (!audioBuffer) {
+            await loadAudio();
+            if (!audioBuffer) return;
         }
 
         isPlaying = true;
         btnPreview.classList.add('playing');
         btnPreview.querySelector('.play-icon').textContent = '■';
         btnPreview.querySelector('.btn-text').textContent = 'STOP';
-        audioStatus.textContent = 'PLAYING REAL BEAT (15S)';
+        audioStatus.textContent = 'PLAYING HUSTLER (15S)';
         audioStatus.classList.add('playing');
 
-        // Scheduler timing setup
-        nextNoteTime = audioCtx.currentTime;
-        current16thNote = 0;
-        schedulerLoop();
+        // Create Source & Gain Nodes
+        currentSource = audioCtx.createBufferSource();
+        currentSource.buffer = audioBuffer;
+
+        gainNode = audioCtx.createGain();
+        gainNode.gain.setValueAtTime(0.85, audioCtx.currentTime);
+
+        // Schedule 2-second fade-out before the 15-second mark
+        gainNode.gain.setValueAtTime(0.85, audioCtx.currentTime + 13.0);
+        gainNode.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 15.0);
+
+        currentSource.connect(gainNode);
+        gainNode.connect(analyser);
+        analyser.connect(audioCtx.destination);
+
+        currentSource.start(0);
 
         // 15 seconds limit timer
         stopTimerId = setTimeout(() => {
@@ -228,201 +252,22 @@ function initAudioEngine() {
         btnPreview.classList.remove('playing');
         btnPreview.querySelector('.play-icon').textContent = '▶';
         btnPreview.querySelector('.btn-text').textContent = '15秒だけ聴く';
-        audioStatus.textContent = 'TAP TO FEEL THE BASS';
+        audioStatus.textContent = '脳天を揺らす808。15秒で世界が変わる。';
         audioStatus.classList.remove('playing');
 
-        if (schedulerTimerId) clearTimeout(schedulerTimerId);
+        if (currentSource) {
+            try {
+                currentSource.stop();
+                currentSource.disconnect();
+            } catch (e) {}
+            currentSource = null;
+        }
+
         if (stopTimerId) clearTimeout(stopTimerId);
         if (drawVisualId) cancelAnimationFrame(drawVisualId);
         
         // Clear canvas
         ctx2d.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
-    }
-
-    // Audio Scheduler Loop
-    function schedulerLoop() {
-        while (nextNoteTime < audioCtx.currentTime + scheduleAheadTime) {
-            scheduleNote(current16thNote, nextNoteTime);
-            advanceNote();
-        }
-        schedulerTimerId = setTimeout(schedulerLoop, lookahead);
-    }
-
-    function advanceNote() {
-        // Advance to next 16th note step
-        const secondsPerBeat = 60.0 / tempo;
-        const secondsPer16th = secondsPerBeat / 4;
-        nextNoteTime += secondsPer16th;
-        
-        current16thNote = (current16thNote + 1) % 16;
-    }
-
-    /* ==========================================================================
-       SOUND SYNTHESIS ENGINES
-       ========================================================================== */
-    function scheduleNote(step, time) {
-        const masterGain = audioCtx.createGain();
-        masterGain.gain.setValueAtTime(0.75, time);
-        
-        // Master Volume Fade-out in the last 2 seconds of preview
-        // Note: active duration is 15s. If audioCtx.currentTime exceeds 13s, fade out.
-        if (audioCtx.currentTime > 12.5) {
-            const fadeRemaining = 15.0 - (audioCtx.currentTime - (nextNoteTime - audioCtx.currentTime));
-            masterGain.gain.setValueAtTime(0.75, time);
-            masterGain.gain.exponentialRampToValueAtTime(0.001, time + 2.0);
-        }
-        
-        masterGain.connect(analyser);
-        analyser.connect(audioCtx.destination);
-
-        // 1. Kick/808 Bass (Sub-Bass) Pattern
-        // Deep sub-bass kick at step 0, step 8, step 11
-        if (step === 0 || step === 8 || step === 11) {
-            play808Bass(time, masterGain);
-        }
-
-        // 2. Snare Pattern
-        // Classic trap snare at 2nd and 4th beats (step 4, step 12)
-        if (step === 4 || step === 12) {
-            playSnare(time, masterGain);
-        }
-
-        // 3. Hi-Hat Pattern
-        // Constant 8th notes, with fast rolls on step 6 and 14
-        let hatPitchMultiplier = 1;
-        let isHatPlaying = false;
-
-        if (step % 2 === 0) {
-            isHatPlaying = true; // Regular 8th note hat
-        } else if (step === 7 || step === 15) {
-            isHatPlaying = true; // Fast roll pickup
-            hatPitchMultiplier = 1.8; // Higher pitch roll
-        }
-
-        if (isHatPlaying) {
-            playHiHat(time, masterGain, hatPitchMultiplier);
-        }
-
-        // 4. Dark Trap Melody Pattern (Minor Cord Arpeggio)
-        // Dark hypnotic synthetic melody plucks
-        playMelody(step, time, masterGain);
-    }
-
-    // Synthesize Sub-Bass (808)
-    function play808Bass(time, dest) {
-        const osc = audioCtx.createOscillator();
-        const gain = audioCtx.createGain();
-        
-        osc.type = 'sine';
-        
-        // Pitch drop effect (808 signature)
-        osc.frequency.setValueAtTime(78, time);
-        osc.frequency.exponentialRampToValueAtTime(41, time + 0.18); // drop to deep low E
-        
-        // Volume envelope
-        gain.gain.setValueAtTime(1.0, time);
-        gain.gain.exponentialRampToValueAtTime(0.01, time + 0.65);
-        
-        osc.connect(gain);
-        gain.connect(dest);
-        
-        osc.start(time);
-        osc.stop(time + 0.7);
-    }
-
-    // Synthesize Trap Snare
-    function playSnare(time, dest) {
-        // Noise component
-        const noise = audioCtx.createBufferSource();
-        noise.buffer = noiseBuffer;
-        
-        const filter = audioCtx.createBiquadFilter();
-        filter.type = 'bandpass';
-        filter.frequency.value = 1100;
-        
-        const noiseGain = audioCtx.createGain();
-        noiseGain.gain.setValueAtTime(0.55, time);
-        noiseGain.gain.exponentialRampToValueAtTime(0.01, time + 0.16);
-        
-        noise.connect(filter);
-        filter.connect(noiseGain);
-        noiseGain.connect(dest);
-
-        // Body component (Low mid pitch drop)
-        const osc = audioCtx.createOscillator();
-        const oscGain = audioCtx.createGain();
-        
-        osc.frequency.setValueAtTime(180, time);
-        osc.frequency.linearRampToValueAtTime(100, time + 0.08);
-        
-        oscGain.gain.setValueAtTime(0.4, time);
-        oscGain.gain.exponentialRampToValueAtTime(0.01, time + 0.08);
-        
-        osc.connect(oscGain);
-        oscGain.connect(dest);
-        
-        noise.start(time);
-        osc.start(time);
-        
-        noise.stop(time + 0.2);
-        osc.stop(time + 0.1);
-    }
-
-    // Synthesize Hi-Hat
-    function playHiHat(time, dest, pitchMod) {
-        const source = audioCtx.createBufferSource();
-        source.buffer = noiseBuffer;
-        
-        const filter = audioCtx.createBiquadFilter();
-        filter.type = 'highpass';
-        filter.frequency.value = 7500 * pitchMod;
-        
-        const gain = audioCtx.createGain();
-        gain.gain.setValueAtTime(0.18, time);
-        gain.gain.exponentialRampToValueAtTime(0.01, time + 0.04);
-        
-        source.connect(filter);
-        filter.connect(gain);
-        gain.connect(dest);
-        
-        source.start(time);
-        source.stop(time + 0.06);
-    }
-
-    // Synthesize Dark Pluck Melody
-    // F# minor dark trap melody arpeggio
-    // F#3 (185Hz), A3 (220Hz), C#4 (277Hz), E4 (329Hz)
-    const melodyNotes = [
-        185, 0, 220, 0, 277, 220, 185, 0,
-        329, 0, 277, 0, 220, 277, 329, 0
-    ];
-
-    function playMelody(step, time, dest) {
-        const noteFreq = melodyNotes[step];
-        if (noteFreq === 0) return; // Rest
-
-        const osc = audioCtx.createOscillator();
-        const filter = audioCtx.createBiquadFilter();
-        const gain = audioCtx.createGain();
-        
-        osc.type = 'sawtooth';
-        osc.frequency.setValueAtTime(noteFreq, time);
-        
-        // Lowpass filter decay to make it "pluck" sound
-        filter.type = 'lowpass';
-        filter.frequency.setValueAtTime(1200, time);
-        filter.frequency.exponentialRampToValueAtTime(150, time + 0.28);
-        
-        // Pluck volume envelope
-        gain.gain.setValueAtTime(0.24, time);
-        gain.gain.exponentialRampToValueAtTime(0.005, time + 0.32);
-        
-        osc.connect(filter);
-        filter.connect(gain);
-        gain.connect(dest);
-        
-        osc.start(time);
-        osc.stop(time + 0.35);
     }
 
     /* ==========================================================================
